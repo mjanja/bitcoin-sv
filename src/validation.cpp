@@ -644,10 +644,10 @@ bool IsMagneticEnabled(const Config &config, const CBlockIndex *pindexPrev) {
 
 static bool IsReplayProtectionEnabled(const Config &config,
                                       int64_t nMedianTimePast) {
-    return nMedianTimePast >= gArgs.GetArg("-replayprotectionactivationtime",
-                                           config.GetChainParams()
-                                               .GetConsensus()
-                                               .magneticAnomalyActivationTime);
+    // this is a quick fix to disable this capability, it ensures that
+    // replay protection will not be enabled
+    // TODO: remove replay protection properly
+    return false;
 }
 
 static bool IsReplayProtectionEnabled(const Config &config,

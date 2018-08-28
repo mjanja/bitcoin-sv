@@ -230,51 +230,48 @@ class ReplayProtectionTest(ComparisonTestFramework):
         send_transaction_to_mempool(txns[0])
         tx_id = send_transaction_to_mempool(txns[1])
 
-        # Activate the replay protection
+        # Activate the replay protection - it shoudn't take effect
         block(5556)
         yield accepted()
 
-        # Non replay protected transactions are not valid anymore,
-        # so they should be removed from the mempool.
-        assert(tx_id not in set(node.getrawmempool()))
+        # Non replay protected transactions should still be valid,
+        # they should be in the mempool.
+        assert(tx_id in set(node.getrawmempool()))
 
-        # Good old transactions are now invalid.
+        # Good old transactions are still valid.
         send_transaction_to_mempool(txns[0])
-        assert_raises_rpc_error(-26, RPC_INVALID_SIGNATURE_ERROR,
-                                node.sendrawtransaction, ToHex(txns[1]))
+        normal_txid = node.sendrawtransaction(ToHex(txns[1]))
 
-        # They also cannot be mined
+        # They can be mined
         block(4)
         update_block(4, txns)
-        yield rejected(RejectResult(16, b'blk-bad-inputs'))
-
-        # Rewind bad block
-        tip(5556)
-
-        # The replay protected transaction is now valid
-        send_transaction_to_mempool(replay_txns[0])
-        replay_tx_id = send_transaction_to_mempool(replay_txns[1])
-
-        # They also can also be mined
-        b5 = block(5)
-        update_block(5, replay_txns)
         yield accepted()
 
-        # Ok, now we check if a reorg work properly accross the activation.
+        # The replay protected transaction are still invalid
+        send_transaction_to_mempool(replay_txns[0])
+        assert_raises_rpc_error(-26, RPC_INVALID_SIGNATURE_ERROR,
+                                node.sendrawtransaction, ToHex(replay_txns[1]))
+
+        # They can't be mined
+        b5 = block(5)
+        update_block(5, replay_txns)
+        yield rejected(RejectResult(16, b'blk-bad-inputs'))
+
+        # Ok, now we check That a reorg work doesnt affect anything.
         postforkblockid = node.getbestblockhash()
         node.invalidateblock(postforkblockid)
-        assert(replay_tx_id in set(node.getrawmempool()))
+        assert(normal_txid in set(node.getrawmempool()))
 
         # Deactivating replay protection.
         forkblockid = node.getbestblockhash()
         node.invalidateblock(forkblockid)
-        assert(replay_tx_id not in set(node.getrawmempool()))
+        assert(normal_txid in set(node.getrawmempool()))
 
         # Check that we also do it properly on deeper reorg.
         node.reconsiderblock(forkblockid)
         node.reconsiderblock(postforkblockid)
         node.invalidateblock(forkblockid)
-        assert(replay_tx_id not in set(node.getrawmempool()))
+        assert(normal_txid in set(node.getrawmempool()))
 
 
 if __name__ == '__main__':
