@@ -1,4 +1,5 @@
 // Copyright (c) 2018 The Bitcoin developers
+// Copyright (c) 2018 The Bitcoin SV developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -6,6 +7,8 @@
 
 #include "policy/policy.h"
 #include "script/interpreter.h"
+#include "script/sign.h"
+#include "keystore.h"
 
 #include <boost/test/unit_test.hpp>
 
@@ -17,26 +20,25 @@ typedef std::vector<valtype> stacktype;
 std::array<uint32_t, 3> flagset{
     {0, STANDARD_SCRIPT_VERIFY_FLAGS, MANDATORY_SCRIPT_VERIFY_FLAGS}};
 
-BOOST_FIXTURE_TEST_SUITE(monolith_opcodes_tests, BasicTestingSetup)
+BOOST_FIXTURE_TEST_SUITE(opcode_tests, BasicTestingSetup)
 
 /**
  * General utility functions to check for script passing/failing.
  */
 static void CheckTestResultForAllFlags(const stacktype &original_stack,
                                        const CScript &script,
-                                       const stacktype &expected) {
+                                       const stacktype &expected,
+                                       uint32_t upgradeFlag) {
     BaseSignatureChecker sigchecker;
 
     for (uint32_t flags : flagset) {
         ScriptError err = SCRIPT_ERR_OK;
         stacktype stack{original_stack};
-        bool r =
-            EvalScript(stack, script, flags | SCRIPT_ENABLE_MONOLITH_OPCODES,
-                       sigchecker, &err);
+        bool r = EvalScript(stack, script, flags | upgradeFlag, sigchecker, &err);
         BOOST_CHECK(r);
         BOOST_CHECK(stack == expected);
 
-        // Make sure that if we do not pass the monolith flag, opcodes are still
+        // Make sure that if we do not pass the upgrade flag, opcodes are still
         // disabled.
         stack = original_stack;
         r = EvalScript(stack, script, flags, sigchecker, &err);
@@ -45,17 +47,29 @@ static void CheckTestResultForAllFlags(const stacktype &original_stack,
     }
 }
 
+// monolith upgrade
+static void CheckTestResultForAllFlags(const stacktype &original_stack,
+                                       const CScript &script,
+                                       const stacktype &expected) {
+    CheckTestResultForAllFlags(original_stack, script, expected, SCRIPT_ENABLE_MONOLITH_OPCODES);
+}
+
+static void CheckTestResultForAllFlagsMagnetic(const stacktype &original_stack,
+                                               const CScript &script,
+                                               const stacktype &expected) {
+    CheckTestResultForAllFlags(original_stack, script, expected, SCRIPT_ENABLE_MAGNETIC_OPCODES);
+}
+
 static void CheckError(uint32_t flags, const stacktype &original_stack,
-                       const CScript &script, ScriptError expected_error) {
+                       const CScript &script, ScriptError expected_error, uint32_t upgradeFlag) {
     BaseSignatureChecker sigchecker;
     ScriptError err = SCRIPT_ERR_OK;
     stacktype stack{original_stack};
-    bool r = EvalScript(stack, script, flags | SCRIPT_ENABLE_MONOLITH_OPCODES,
-                        sigchecker, &err);
+    bool r = EvalScript(stack, script, flags | upgradeFlag, sigchecker, &err);
     BOOST_CHECK(!r);
     BOOST_CHECK_EQUAL(err, expected_error);
 
-    // Make sure that if we do not pass the monolith flag, opcodes are still
+    // Make sure that if we do not pass the opcodes flags, opcodes are still
     // disabled.
     stack = original_stack;
     r = EvalScript(stack, script, flags, sigchecker, &err);
@@ -63,12 +77,34 @@ static void CheckError(uint32_t flags, const stacktype &original_stack,
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISABLED_OPCODE);
 }
 
-static void CheckErrorForAllFlags(const stacktype &original_stack,
-                                  const CScript &script,
-                                  ScriptError expected_error) {
+// monolith upgrade
+static void CheckError(uint32_t flags, const stacktype &original_stack,
+                       const CScript &script, ScriptError expected_error) {
+    CheckError(flags, original_stack, script, expected_error, SCRIPT_ENABLE_MONOLITH_OPCODES);
+}
+
+static void CheckErrorMagnetic(uint32_t flags, const stacktype &original_stack,
+                       const CScript &script, ScriptError expected_error) {
+    CheckError(flags, original_stack, script, expected_error, SCRIPT_ENABLE_MAGNETIC_OPCODES);
+}
+
+static void CheckErrorForAllFlags(const stacktype &original_stack, const CScript &script,
+                                  ScriptError expected_error, uint32_t upgradeFlag) {
     for (uint32_t flags : flagset) {
-        CheckError(flags, original_stack, script, expected_error);
+        CheckError(flags, original_stack, script, expected_error, upgradeFlag);
     }
+}
+
+// monolith upgrade
+static void CheckErrorForAllFlags(const stacktype &original_stack, const CScript &script,
+                                  ScriptError expected_error) {
+    CheckErrorForAllFlags(original_stack, script, expected_error, SCRIPT_ENABLE_MONOLITH_OPCODES);
+}
+
+// magnetic upgrade
+static void CheckErrorForAllFlagsMagnetic(const stacktype &original_stack, const CScript &script,
+                                  ScriptError expected_error) {
+    CheckErrorForAllFlags(original_stack, script, expected_error, SCRIPT_ENABLE_MAGNETIC_OPCODES);
 }
 
 static void CheckOpError(const stacktype &original_stack, opcodetype op,
@@ -88,6 +124,15 @@ static void CheckBinaryOp(const valtype &a, const valtype &b, opcodetype op,
     CheckTestResultForAllFlags({a, b}, CScript() << op, {expected});
 }
 
+static void CheckBinaryOpMagnetic(const valtype &a, const valtype &b, opcodetype op,
+                          const valtype &expected) {
+    CheckTestResultForAllFlagsMagnetic({a, b}, CScript() << op, {expected});
+}
+
+static void CheckUnaryOpMagnetic(const valtype &a, opcodetype op, const valtype &expected) {
+    CheckTestResultForAllFlagsMagnetic({a}, CScript() << op, {expected});
+}
+
 static valtype NegativeValtype(const valtype &v) {
     valtype r(v);
     if (r.size() > 0) {
@@ -95,6 +140,55 @@ static valtype NegativeValtype(const valtype &v) {
     }
     CScriptNum::MinimallyEncode(r);
     return r;
+}
+
+// convert the binary string into a vector of bytes
+// Expects str to contain 8*n bits.
+// see self_bitpattern_test for examples
+static valtype to_bitpattern(const char *str) {
+    size_t len = strlen(str); 
+ 
+    valtype val((len - 1) / 8 + 1, 0); 
+ 
+    const char *pin = &str[len - 1]; 
+    for (size_t i = 0; i < len; i++) {
+        int byte_idx = (len - 1 - i) / 8;
+        int bit_idx = i % 8; 
+ 
+        int8_t mask = 1 << bit_idx; 
+ 
+        if (*pin == '0') {
+            val[byte_idx] &= ~mask; 
+        } else {
+            val[byte_idx] |= mask; 
+        } 
+        pin--; 
+    } 
+    return val; 
+}
+
+// test the bitpattern function
+BOOST_AUTO_TEST_CASE(self_bitpattern_test)
+{
+    BOOST_CHECK(valtype({0x01}) == to_bitpattern("00000001"));
+    BOOST_CHECK(valtype({0x80}) == to_bitpattern("10000000"));
+    BOOST_CHECK(valtype({0x84}) == to_bitpattern("10000100"));
+    BOOST_CHECK(valtype({0xFF}) == to_bitpattern("11111111"));
+    BOOST_CHECK(valtype({0x00}) == to_bitpattern("00000000"));
+
+    BOOST_CHECK(valtype({0x00, 0x00}) == to_bitpattern("0000000000000000"));
+    BOOST_CHECK(valtype({0xFF, 0xFF}) == to_bitpattern("1111111111111111"));
+    BOOST_CHECK(valtype({0x01, 0x01}) == to_bitpattern("0000000100000001"));
+    BOOST_CHECK(valtype({0x80, 0x80}) == to_bitpattern("1000000010000000"));
+    BOOST_CHECK(valtype({0xFF, 0x00}) == to_bitpattern("1111111100000000"));
+    BOOST_CHECK(valtype({0xAA, 0x55}) == to_bitpattern("1010101001010101"));
+
+    BOOST_CHECK(valtype({0x00, 0x00, 0x00}) == to_bitpattern("000000000000000000000000"));
+    BOOST_CHECK(valtype({0xFF, 0xFF, 0xFF}) == to_bitpattern("111111111111111111111111"));
+    BOOST_CHECK(valtype({0xFF, 0x00, 0xAA}) == to_bitpattern("111111110000000010101010"));
+    BOOST_CHECK(valtype({0xAA, 0x55, 0x00}) == to_bitpattern("101010100101010100000000"));
+
+    BOOST_CHECK(valtype({0x9F, 0x11, 0xF5, 0x55}) == to_bitpattern("10011111000100011111010101010101"));
 }
 
 BOOST_AUTO_TEST_CASE(negative_valtype_test) {
@@ -409,6 +503,145 @@ BOOST_AUTO_TEST_CASE(bitwise_opcodes_test) {
     CheckAllBitwiseOpErrors({b, {}}, SCRIPT_ERR_INVALID_OPERAND_SIZE);
 }
 
+BOOST_AUTO_TEST_CASE(invert_test)
+{ 
+    CheckUnaryOpMagnetic({},     OP_INVERT, {});
+    CheckUnaryOpMagnetic({0x00}, OP_INVERT, {0xFF});
+    CheckUnaryOpMagnetic({0xFF}, OP_INVERT, {0x00});
+    CheckUnaryOpMagnetic({0xFF, 0xA0, 0xCE, 0xA0, 0x96, 0x12}, OP_INVERT, {0x00, 0x5F, 0x31, 0x5F, 0x69, 0xED});
+} 
+
+static void CheckShiftOp(const valtype &x, const valtype &n, opcodetype op, const valtype &expected) {
+    CheckBinaryOpMagnetic(x, n, op, expected);
+}
+
+BOOST_AUTO_TEST_CASE(lshift_test)
+{ 
+    CheckShiftOp({}, {},     OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x01}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x02}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x07}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x08}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x09}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x0F}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x10}, OP_LSHIFT, {}); 
+    CheckShiftOp({}, {0x11}, OP_LSHIFT, {}); 
+ 
+    CheckShiftOp({0xFF}, {},     OP_LSHIFT, to_bitpattern("11111111")); 
+    CheckShiftOp({0xFF}, {0x01}, OP_LSHIFT, to_bitpattern("11111110")); 
+    CheckShiftOp({0xFF}, {0x02}, OP_LSHIFT, to_bitpattern("11111100")); 
+    CheckShiftOp({0xFF}, {0x03}, OP_LSHIFT, to_bitpattern("11111000")); 
+    CheckShiftOp({0xFF}, {0x04}, OP_LSHIFT, to_bitpattern("11110000")); 
+    CheckShiftOp({0xFF}, {0x05}, OP_LSHIFT, to_bitpattern("11100000")); 
+    CheckShiftOp({0xFF}, {0x06}, OP_LSHIFT, to_bitpattern("11000000")); 
+    CheckShiftOp({0xFF}, {0x07}, OP_LSHIFT, to_bitpattern("10000000")); 
+    CheckShiftOp({0xFF}, {0x08}, OP_LSHIFT, to_bitpattern("00000000")); 
+ 
+    CheckShiftOp({0xFF}, {0x01}, OP_LSHIFT, {0xFE}); 
+    CheckShiftOp({0xFF}, {0x02}, OP_LSHIFT, {0xFC}); 
+    CheckShiftOp({0xFF}, {0x03}, OP_LSHIFT, {0xF8}); 
+    CheckShiftOp({0xFF}, {0x04}, OP_LSHIFT, {0xF0}); 
+    CheckShiftOp({0xFF}, {0x05}, OP_LSHIFT, {0xE0}); 
+    CheckShiftOp({0xFF}, {0x06}, OP_LSHIFT, {0xC0}); 
+    CheckShiftOp({0xFF}, {0x07}, OP_LSHIFT, {0x80});
+
+    // bitpattern, not a number so not reduced to zero bytes
+    CheckShiftOp({0xFF}, {0x08}, OP_LSHIFT, {0x00});
+
+    // shift single bit over byte boundary
+    CheckShiftOp({0x00, 0x80}, {0x01}, OP_LSHIFT, {0x01, 0x00});
+    CheckShiftOp({0x00, 0x80, 0x00}, {0x01}, OP_LSHIFT, {0x01, 0x00, 0x00});
+    CheckShiftOp({0x00, 0x00, 0x80}, {0x01}, OP_LSHIFT, {0x00, 0x01, 0x00});
+    CheckShiftOp({0x80, 0x00, 0x00}, {0x01}, OP_LSHIFT, {0x00, 0x00, 0x00});
+
+    // {0x9F, 0x11, 0xF5, 0x55} is a sequence of bytes that is equal to the bit pattern
+    // "1001 1111 0001 0001 1111 0101 0101 0101"
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {},     OP_LSHIFT, to_bitpattern("10011111000100011111010101010101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x01}, OP_LSHIFT, to_bitpattern("00111110001000111110101010101010"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x02}, OP_LSHIFT, to_bitpattern("01111100010001111101010101010100"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x03}, OP_LSHIFT, to_bitpattern("11111000100011111010101010101000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x04}, OP_LSHIFT, to_bitpattern("11110001000111110101010101010000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x05}, OP_LSHIFT, to_bitpattern("11100010001111101010101010100000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x06}, OP_LSHIFT, to_bitpattern("11000100011111010101010101000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x07}, OP_LSHIFT, to_bitpattern("10001000111110101010101010000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x08}, OP_LSHIFT, to_bitpattern("00010001111101010101010100000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x09}, OP_LSHIFT, to_bitpattern("00100011111010101010101000000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0A}, OP_LSHIFT, to_bitpattern("01000111110101010101010000000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0B}, OP_LSHIFT, to_bitpattern("10001111101010101010100000000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0C}, OP_LSHIFT, to_bitpattern("00011111010101010101000000000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0D}, OP_LSHIFT, to_bitpattern("00111110101010101010000000000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0E}, OP_LSHIFT, to_bitpattern("01111101010101010100000000000000"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0F}, OP_LSHIFT, to_bitpattern("11111010101010101000000000000000"));
+
+    // second parameter, n < 0 - should produce error
+    CheckErrorForAllFlagsMagnetic({valtype{0x12, 0x34}}, CScript() << OP_1NEGATE << OP_LSHIFT,
+                          SCRIPT_ERR_INVALID_NUMBER_RANGE); 
+} 
+ 
+BOOST_AUTO_TEST_CASE(rshift_test) 
+{ 
+    CheckShiftOp({}, {},     OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x01}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x02}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x07}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x08}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x09}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x0F}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x10}, OP_RSHIFT, {}); 
+    CheckShiftOp({}, {0x11}, OP_RSHIFT, {}); 
+ 
+    CheckShiftOp({0xFF}, {},     OP_RSHIFT, to_bitpattern("11111111")); 
+    CheckShiftOp({0xFF}, {0x01}, OP_RSHIFT, to_bitpattern("01111111")); 
+    CheckShiftOp({0xFF}, {0x02}, OP_RSHIFT, to_bitpattern("00111111")); 
+    CheckShiftOp({0xFF}, {0x03}, OP_RSHIFT, to_bitpattern("00011111")); 
+    CheckShiftOp({0xFF}, {0x04}, OP_RSHIFT, to_bitpattern("00001111")); 
+    CheckShiftOp({0xFF}, {0x05}, OP_RSHIFT, to_bitpattern("00000111")); 
+    CheckShiftOp({0xFF}, {0x06}, OP_RSHIFT, to_bitpattern("00000011")); 
+    CheckShiftOp({0xFF}, {0x07}, OP_RSHIFT, to_bitpattern("00000001")); 
+    CheckShiftOp({0xFF}, {0x08}, OP_RSHIFT, to_bitpattern("00000000")); 
+
+ 
+    CheckShiftOp({0xFF}, {0x01}, OP_RSHIFT, {0x7F}); 
+    CheckShiftOp({0xFF}, {0x02}, OP_RSHIFT, {0x3F}); 
+    CheckShiftOp({0xFF}, {0x03}, OP_RSHIFT, {0x1F}); 
+    CheckShiftOp({0xFF}, {0x04}, OP_RSHIFT, {0x0F});
+    CheckShiftOp({0xFF}, {0x05}, OP_RSHIFT, {0x07}); 
+    CheckShiftOp({0xFF}, {0x06}, OP_RSHIFT, {0x03}); 
+    CheckShiftOp({0xFF}, {0x07}, OP_RSHIFT, {0x01});
+
+    // bitpattern, not a number so not reduced to zero bytes
+    CheckShiftOp({0xFF}, {0x08}, OP_RSHIFT, {0x00});
+
+    // shift single bit over byte boundary
+    CheckShiftOp({0x01, 0x00}, {0x01}, OP_RSHIFT, {0x00, 0x80});
+    CheckShiftOp({0x01, 0x00, 0x00}, {0x01}, OP_RSHIFT, {0x00, 0x80, 0x00});
+    CheckShiftOp({0x00, 0x01, 0x00}, {0x01}, OP_RSHIFT, {0x00, 0x00, 0x80});
+    CheckShiftOp({0x00, 0x00, 0x01}, {0x01}, OP_RSHIFT, {0x00, 0x00, 0x00});
+
+    // {0x9F, 0x11, 0xF5, 0x55} is a sequence of bytes that is equal to the bit pattern
+    // "1001 1111 0001 0001 1111 0101 0101 0101"
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {},     OP_RSHIFT, to_bitpattern("10011111000100011111010101010101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x01}, OP_RSHIFT, to_bitpattern("01001111100010001111101010101010"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x02}, OP_RSHIFT, to_bitpattern("00100111110001000111110101010101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x03}, OP_RSHIFT, to_bitpattern("00010011111000100011111010101010"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x04}, OP_RSHIFT, to_bitpattern("00001001111100010001111101010101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x05}, OP_RSHIFT, to_bitpattern("00000100111110001000111110101010"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x06}, OP_RSHIFT, to_bitpattern("00000010011111000100011111010101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x07}, OP_RSHIFT, to_bitpattern("00000001001111100010001111101010"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x08}, OP_RSHIFT, to_bitpattern("00000000100111110001000111110101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x09}, OP_RSHIFT, to_bitpattern("00000000010011111000100011111010"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0A}, OP_RSHIFT, to_bitpattern("00000000001001111100010001111101"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0B}, OP_RSHIFT, to_bitpattern("00000000000100111110001000111110"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0C}, OP_RSHIFT, to_bitpattern("00000000000010011111000100011111"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0D}, OP_RSHIFT, to_bitpattern("00000000000001001111100010001111"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0E}, OP_RSHIFT, to_bitpattern("00000000000000100111110001000111"));
+    CheckShiftOp({0x9F, 0x11, 0xF5, 0x55}, {0x0F}, OP_RSHIFT, to_bitpattern("00000000000000010011111000100011"));
+
+    // second parameter, n < 0 - should produce error
+    CheckErrorForAllFlagsMagnetic({valtype{0x12, 0x34}}, CScript() << OP_1NEGATE << OP_RSHIFT,
+                          SCRIPT_ERR_INVALID_NUMBER_RANGE);
+}
+
 /**
  * String opcodes.
  */
@@ -652,6 +885,46 @@ BOOST_AUTO_TEST_CASE(type_conversion_test) {
 /**
  * Arithmetic Opcodes
  */
+static void CheckMul(const valtype &a, const valtype &b, const valtype &expected) 
+{ 
+    // Negative values for multiplication
+    CheckBinaryOpMagnetic(a, b, OP_MUL, expected);
+    CheckBinaryOpMagnetic(a, NegativeValtype(b), OP_MUL, NegativeValtype(expected));
+    CheckBinaryOpMagnetic(NegativeValtype(a), b, OP_MUL, NegativeValtype(expected));
+    CheckBinaryOpMagnetic(NegativeValtype(a), NegativeValtype(b), OP_MUL, expected);
+ 
+    // Commutativity 
+    CheckBinaryOpMagnetic(b, a, OP_MUL, expected);
+    CheckBinaryOpMagnetic(b, NegativeValtype(a), OP_MUL, NegativeValtype(expected));
+    CheckBinaryOpMagnetic(NegativeValtype(b), a, OP_MUL, NegativeValtype(expected));
+    CheckBinaryOpMagnetic(NegativeValtype(b), NegativeValtype(a), OP_MUL, expected);
+
+    // Multiplication identities 
+    CheckBinaryOpMagnetic(a, {0x01}, OP_MUL, a);
+    CheckBinaryOpMagnetic(a, {0x81}, OP_MUL, NegativeValtype(a));
+    CheckBinaryOpMagnetic(a, {}, OP_MUL, {});
+
+    CheckBinaryOpMagnetic({0x01}, b, OP_MUL, b);
+    CheckBinaryOpMagnetic({0x81}, b, OP_MUL, NegativeValtype(b));
+    CheckBinaryOpMagnetic({}, b, OP_MUL, {});
+}
+
+BOOST_AUTO_TEST_CASE(mul_test) 
+{
+    CheckMul({0x05}, {0x06}, {0x1E});
+    CheckMul({0x05}, {0x26}, {0xBE, 0x00});
+    CheckMul({0x45}, {0x26}, {0x3E, 0x0A});
+    CheckMul({0x02}, {0x56, 0x24}, {0xAC, 0x48});
+    CheckMul({0x05}, {0x26, 0x03, 0x32}, {0xBE, 0x0F, 0xFA, 0x00});
+    CheckMul({0x06}, {0x26, 0x03, 0x32, 0x04}, {0xE4, 0x12, 0x2C, 0x19});
+    CheckMul({0xA0, 0xA0}, {0xF5, 0xE4}, {0x20, 0xB9, 0xDD, 0x0C}); // -20A0*-64F5=0CDDB920
+    CheckMul({0x05, 0x26}, {0x26, 0x03, 0x32}, {0xBE, 0xB3, 0x71, 0x6D, 0x07});
+    CheckMul({0x06, 0x26}, {0x26, 0x03, 0x32, 0x04}, {0xE4, 0xB6, 0xA3, 0x85, 0x9F, 0x00});
+    CheckMul({0x05, 0x26, 0x09}, {0x26, 0x03, 0x32}, {0xBE, 0xB3, 0xC7, 0x89, 0xC9, 0x01});
+    CheckMul({0x06, 0x26, 0x09}, {0x26, 0x03, 0x32, 0x04}, {0xE4, 0xB6, 0xF9, 0xA1, 0x61, 0x26});
+    CheckMul({0x06, 0x26, 0x09, 0x34}, {0x26, 0x03, 0x32, 0x04}, {0xE4, 0xB6, 0xF9, 0x59, 0x05, 0x4F, 0xDA, 0x00});
+}
+
 static void CheckDivMod(const valtype &a, const valtype &b,
                         const valtype &divExpected,
                         const valtype &modExpected) {
@@ -785,5 +1058,114 @@ BOOST_AUTO_TEST_CASE(div_and_mod_opcode_tests) {
     CheckDivMod({0xbb, 0xf0, 0x5d, 0x03}, {0x4e, 0x67, 0xab, 0x21}, {},
                 {0xbb, 0xf0, 0x5d, 0x03});
 }
+
+static size_t NonPushOpCodeCount(const CScript& script)
+{ 
+    CScript::const_iterator pc = script.begin(); 
+    CScript::const_iterator pend = script.end(); 
+    size_t cnt = 0; 
+    opcodetype opcode; 
+    valtype value; 
+    while (pc < pend) 
+    { 
+        script.GetOp(pc, opcode, value); 
+        if (opcode > OP_16) 
+             ++cnt; 
+    } 
+    return cnt; 
+} 
+ 
+static void CheckTestForOpCodeLimit(const stacktype &original_stack, 
+                                       const CScript &script, 
+                                       const stacktype &expected, 
+                                       const BaseSignatureChecker& sigchecker) 
+{ 
+    std::array<uint32_t, 3> release_dependent_flagset{ 
+        {0, SCRIPT_ENABLE_MAGNETIC_OPCODES}}; 
+
+    for (uint32_t std_flags : flagset) 
+    { 
+        for(uint32_t rdep_flags : release_dependent_flagset) 
+        { 
+            uint32_t flags = std_flags | rdep_flags; 
+
+            ScriptError err = SCRIPT_ERR_OK; 
+            stacktype stack{original_stack}; 
+            bool r = EvalScript(stack, script, flags, sigchecker, &err); 
+
+            if(   (rdep_flags & SCRIPT_ENABLE_MAGNETIC_OPCODES) == 0  
+               && NonPushOpCodeCount(script) > MAX_OPS_PER_SCRIPT) 
+            { 
+                BOOST_CHECK(!r); 
+            }
+            else 
+            { 
+                BOOST_CHECK(r); 
+            } 
+	} 
+    } 
+} 
+
+static void add_30(CScript& script) 
+{   
+    script << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD                                  
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD 
+           << OP_1 << OP_ADD << OP_1 << OP_ADD << OP_1 << OP_ADD; 
+} 
+ 
+BOOST_AUTO_TEST_CASE(opcode_nolimit_tests)  
+{ 
+    DummySignatureCreator sigfactory(nullptr); 
+    const BaseSignatureChecker& sigchecker = sigfactory.Checker(); 
+
+    // test with one opcode
+    CheckTestForOpCodeLimit({}, CScript() << OP_1 << OP_1 << OP_ADD, {valtype{OP_1}}, sigchecker);
+
+    {
+        CScript script; 
+        script << OP_1;
+
+        // test with 6*30=180 opcodes, which is under MAX_OPS_PER_SCRIPT
+        add_30(script);add_30(script);add_30(script); 
+        add_30(script);add_30(script);add_30(script); 
+        CheckTestForOpCodeLimit({}, script, {valtype{181}}, sigchecker); 
+
+        // test with 6*30+3*30=270 opcodes, which is over MAX_OPS_PER_SCRIPT legacy limit
+        add_30(script);add_30(script);add_30(script); 
+        CheckTestForOpCodeLimit({}, script, {valtype{0x0F, 0x01}}, sigchecker); 
+    } 
+
+    // Check OP_CHECKMULTISIG/OP_CHECKMULTISIGVERIFY as this  
+    // explicitly checks MAX_OPS_PER_SCRIPT.  
+    { 
+        CScript script; 
+        script << OP_1; 
+        add_30(script);add_30(script);add_30(script); 
+        add_30(script);add_30(script);add_30(script); 
+ 
+        // Create multi-sig signatures + public keys.  
+        std::vector<uint8_t> signature;  // dummy signature 
+        sigfactory.CreateSig(signature, CKeyID(), CScript()); 
+        std::vector<uint8_t> publickey(33, '\0'); // dummy pubkey 
+        publickey[0] = '\x02'; 
+        script << OP_0 << signature << signature << OP_2 
+               << publickey << publickey << publickey << OP_3 
+               << OP_CHECKMULTISIG;
+
+        // test with 6*30=180 opcodes, which is under MAX_OPS_PER_SCRIPT
+        CheckTestForOpCodeLimit({}, script, {valtype{0x0F, 0x01}}, sigchecker);
+ 
+        add_30(script);add_30(script);add_30(script);
+        // test with 6*30+3*30=270 opcodes, which is over MAX_OPS_PER_SCRIPT legacy limit
+        CheckTestForOpCodeLimit({}, script, {valtype{0x0F, 0x01}}, sigchecker);
+    } 
+} 
 
 BOOST_AUTO_TEST_SUITE_END()
